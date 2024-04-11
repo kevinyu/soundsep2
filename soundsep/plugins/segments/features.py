@@ -1,5 +1,8 @@
 import logging
 import json
+import time
+from multiprocessing import Queue, Process, Event
+import threading
 from functools import partial
 from typing import List, Tuple
 import concurrent.futures
@@ -20,6 +23,7 @@ from soundsep.core.utils import hhmmss
 
 # TODO move to core or something
 class WorkerSignals(QObject):
+    done_adding = pyqtSignal()
     finished = pyqtSignal()
     progress = pyqtSignal(int)
 
@@ -71,7 +75,6 @@ class FeatureGenerationPanel(widgets.QWidget):
     
     def on_finished_signal(self):
         self.progress.deleteLater()
-
 
 
 
@@ -179,28 +182,77 @@ class FeaturePlugin(BasePlugin):
         # get segIDs that have not been processed
         unprocessed_segIDs = [segID for segID in all_segIDs if segID not in processed_segIDs]
 
+        nworkers = 4
+        done_prep_event = Event()
+        audio_queue = Queue()
+        feature_queue = Queue()
+        progress_queue = Queue()
+        
+        progress_process = threading.Thread(target=progress_updater, args=(progress_queue, self.worker_signals.progress, len(unprocessed_segIDs)))
+        progress_process.start()
+        feature_processes = []
+        for i in range(nworkers):
+            feature_processes.append(FeatureExtractionProcess(audio_queue, feature_queue, progress_queue, done_prep_event))
+            feature_processes[-1].start()
+        
+        # TODO Can launch this on a thread...
+        max_queue_size = 4*nworkers
+        for segID in unprocessed_segIDs:
+            audio, sr = self.get_segment_audio(segID)
+            while audio_queue.qsize() > max_queue_size:
+                time.sleep(.1)
+            audio_queue.put((segID, audio, sr))
+        # now notify them no more will be added
+        done_prep_event.set()
+
         new_segs = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-            futures = []
-            print("Initializing processes")
-            for segID in unprocessed_segIDs:
-                audio, sr = self.get_segment_audio(segID)
-                #futures.append(executor.submit(generate_audio_features, audio, sr, segID))
-            print("Processes initialized")
-            for future in concurrent.futures.as_completed(futures):
-                new_segs.append(future.result())
-                self.worker_signals.progress.emit(len(new_segs) / len(unprocessed_segIDs) * 100)
-            new_segs = pd.DataFrame(new_segs)
-        # for segID in unprocessed_segIDs:
-        #     audio, sr = self.get_segment_audio(segID)
-        #     new_segs.append(generate_audio_features(audio, sr, segID))
-        #     self.worker_signals.progress.emit(len(new_segs) / len(unprocessed_segIDs) * 100)
+        while not np.all([p.is_alive() for p in feature_processes]) or not feature_queue.empty():
+            all_features = feature_queue.get()
+            features = {}
+            new_segs.append(feature_queue.get())
+            self.worker_signals.progress.emit(len(new_segs) / len(unprocessed_segIDs) * 100)
+
         new_segs = pd.DataFrame(new_segs)
         new_segs.set_index('SegmentID', inplace=True)
         self._feature_datastore[new_segs.index] = new_segs
         self.worker_signals.finished.emit()
         #self._feature_datastore = pd.concat([self._feature_datastore, new_segs])
 
+    def save_features(self):
+        save_file = self.api.paths.save_dir / self.SAVE_FILENAME
+        self._feature_datastore.to_csv(save_file)
+
+def progress_updater(progress_queue_in, progress_signal_out, n):
+    n_done = 0
+    # loop until done or sigabbrt
+    while n_done < n:
+        seg_id_done = progress_queue_in.get()
+        n_done += 1
+        progress_signal_out.emit(n_done / n * 100)
+
+def load_all_audio(load_func, seg_ids, queue, max_queue_size, done_event):
+    for seg_id in seg_ids:
+        audio, sr = load_func(seg_id)
+        while queue.qsize() > max_queue_size:
+            time.sleep(.1)
+        queue.put((seg_id, audio, sr))
+    done_event.set()
+class FeatureExtractionProcess(Process):
+    def __init__(self, in_queue, out_queue, progress_queue, stop_signal):
+        super().__init__()
+        self.input_queue = in_queue
+        self.stop_signal = stop_signal
+        self.output_queue = out_queue
+        self.progress_queue = progress_queue
+
+    def run(self):
+        print("Beginning Feature Extraction Process")
+        while not self.stop_signal.is_set() or not self.queue.empty():
+            segmentID, audio, sr = self.input_queue.get()
+            features = generate_audio_features(audio, sr, segmentID)
+            self.output_queue.put(features)
+            self.progress_queue.put(segmentID)
+        print("Exiting feature extraction process")
 #from numba import jit
 #@jit(nogil=True)
 def _extract_features( audio: np.ndarray, sr: int, segmentID: int, normalize: bool) -> List[float]:
@@ -214,7 +266,12 @@ def _extract_features( audio: np.ndarray, sr: int, segmentID: int, normalize: bo
     f_formants = features_formants(audio, sr)
     f_spectrum = features_spectrum(audio, sr)
     # combine all these dictionaries
-    output_features = {**f_amp, **f_fund, **f_formants, **f_spectrum}
+    output_features = dict({
+        "amp": f_amp,
+        "fund": f_fund,
+        "formants": f_formants,
+        "spectrum": f_spectrum  
+    })
     return output_features
 
     # return dict({ 'SegmentID': segmentID,
@@ -280,7 +337,7 @@ def features_ampenv(audio, sr, cutoff_freq = 20, amp_sample_rate = 1000):
     })
 
 def features_fundamental(audio, sr, maxFund = 1500, minFund = 300, lowFc = 200, highFc = 6000, minSaliency = 0.5, method='HPS'):
-    funds_salience = sound.fundEstOptim(audio, sr, maxFund = maxFund, minFund = minFund, lowFc = lowFc, highFc = highFc, minSaliency = minSaliency, method = method)
+    funds_salience = sound.fundEstOptim(audio, sr, stride_length=256, maxFund = maxFund, minFund = minFund, lowFc = lowFc, highFc = highFc, minSaliency = minSaliency, method = method)
     f0 = funds_salience[:,0]
     f0_2 = funds_salience[:,1]
     sal = funds_salience[:,2]
@@ -308,7 +365,7 @@ def features_fundamental(audio, sr, maxFund = 1500, minFund = 300, lowFc = 200, 
     #self.voice2percent = np.nanmean(funds_salience[:,4])*100
 
 def features_formants(audio, sr,  lowFc = 200, highFc = 6000, minFormantFreq = 500, maxFormantBW = 500, windowFormant = 0.1):
-    formants = sound.formantEstimator(audio, sr, lowFc=lowFc, highFc=highFc, windowFormant = windowFormant,
+    formants = sound.formantEstimator(audio, sr, stride_length=256,lowFc=lowFc, highFc=highFc, windowFormant = windowFormant,
                                     minFormantFreq = minFormantFreq, maxFormantBW = maxFormantBW )
     F1 = formants[:,0]
     F2 = formants[:,1]
