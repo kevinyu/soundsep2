@@ -8,6 +8,10 @@ from typing import List, Tuple
 import concurrent.futures
 from soundsig.sound import BioSound
 import soundsig.sound as sound
+import warnings
+from scipy.signal import firwin, filtfilt
+
+
 
 import PyQt6.QtWidgets as widgets
 import pyqtgraph as pg
@@ -22,6 +26,7 @@ from soundsep.core.segments import Segment
 from soundsep.core.utils import hhmmss
 
 # TODO move to core or something
+warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 class WorkerSignals(QObject):
     done_adding = pyqtSignal()
     finished = pyqtSignal()
@@ -35,12 +40,16 @@ class FeatureGenerationPanel(widgets.QWidget):
     def __init__(self, parent=None,features=None):
         super().__init__(parent)
 
-        self.FEATURELIST=features
+        self.FEATUREDICT=features        
+        self.indiv_features = []
+        for k,v in features.items():
+            self.indiv_features.extend(v)
         self.init_ui()
 
     
     def init_ui(self):
-        features = self.FEATURELIST
+
+        
 
         layout = widgets.QVBoxLayout()
         # add a generate button
@@ -48,19 +57,40 @@ class FeatureGenerationPanel(widgets.QWidget):
         layout.addWidget(self.generate_button)
         self.generate_button.clicked.connect(self.on_button_press)
         
+        # Add checkboxes for each feature class
+        self.feature_checkboxes = {}
+        checkbox_layout = widgets.QHBoxLayout()
+        for k in self.FEATUREDICT.keys():
+            self.feature_checkboxes[k] = widgets.QCheckBox(k)
+            self.feature_checkboxes[k].setChecked(True)
+
+            checkbox_layout.addWidget(self.feature_checkboxes[k])
+        layout.addLayout(checkbox_layout)
 
         # add the feature table
-        self.table = widgets.QTableWidget(0, len(features)+1)
+        self.feature_to_column = dict(zip(self.indiv_features, range(1, len(self.indiv_features)+1))) 
+        self.table = widgets.QTableWidget(0, len(self.indiv_features)+1)
         self.table.setEditTriggers(widgets.QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self.table.setColumnHidden(0, True)
-        self.table.setHorizontalHeaderLabels(['segHASH'] + self.FEATURELIST)
+        self.table.setHorizontalHeaderLabels(['segID'] + self.indiv_features)
         header = self.table.horizontalHeader()
-        for i in range(1, len(features)+1):
+        for i in range(1, len(self.indiv_features)+1):
             header.setSectionResizeMode(i, widgets.QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
 
         self.setLayout(layout)
+
+        # init actions
+        self.table.itemSelectionChanged.connect(self.on_click)
+
+    
+    def set_feature_selection(self, feature_selections):
+        for k,v in feature_selections.items():
+            if self.feature_checkboxes[k].isChecked() != v:
+                self.feature_checkboxes[k].setChecked(v)
+            for feature in self.FEATUREDICT[k]:
+                self.table.setColumnHidden(self.feature_to_column[feature], not v)
 
     def on_button_press(self):
         # Add a progress bar into the qvboxlayout
@@ -76,27 +106,138 @@ class FeatureGenerationPanel(widgets.QWidget):
     def on_finished_signal(self):
         self.progress.deleteLater()
 
+    def add_or_edit_row(self, feature_row):
+        ind = self._find_segment_row_by_segID(feature_row.name)
+        if ind is not None:
+            self.table.setSortingEnabled(False)
+            # Edit the row
+            for i, feature in enumerate(self.indiv_features):
+                self.table.setItem(ind, i+1, widgets.QTableWidgetItem(str("%.2f"%feature_row[feature])))
+            self.table.setSortingEnabled(True)
+            return
+        else:
+            self.add_row(feature_row)
+    def add_row(self, feature_row):
+        # Add the row
+        self.table.setSortingEnabled(False)
+        ind = self.table.rowCount()
+        self.table.insertRow(self.table.rowCount())
+        self.table.setItem(ind, 0, widgets.QTableWidgetItem(str(feature_row.name)))
+        for i, feature in enumerate(self.indiv_features):
+            self.table.setItem(ind, i+1, widgets.QTableWidgetItem(str("%.2f"%feature_row[feature])))
+        self.table.setSortingEnabled(True)
 
+    # Selection functions
+    def on_click(self):
+        selection = self.get_selection()
+        self.segmentSelectionChanged.emit(selection)
+
+    def on_selection_changed(self, selection):
+        self.table.itemSelectionChanged.disconnect(self.on_click)
+        self.set_selection(selection)
+        self.table.itemSelectionChanged.connect(self.on_click)
+
+
+
+    def _find_segment_row_by_segID(self, seg_id):
+        for i in range(self.table.rowCount()):
+            if self.table.item(i, 0).text() == str(seg_id):
+                return i
+        return None
+    
+    def remove_row_by_segID(self, seg_id):
+        ind = self._find_segment_row_by_segID(seg_id)
+        if seg_id in self.get_selection():
+            self.table.clearSelection()
+        if ind is not None:
+            self.table.removeRow(ind)
+        else:
+            raise ValueError("Cannot remove Segment ID {}: not found in table".format(seg_id))
+
+
+    def get_selection(self):
+        selection = []
+        ranges = self.table.selectedRanges()
+        for selection_range in ranges:
+            selection += list(range(selection_range.topRow(), selection_range.bottomRow() + 1))
+        # Get IDS for each selected ROW
+        ids = [int(self.table.item(row, 0).text()) for row in selection]
+        return sorted(ids)
+
+    def set_selection(self, selection):
+        self.table.clearSelection()
+            
+        for seg_id in selection:
+            table_ind = self._find_segment_row_by_segID(seg_id)
+            if table_ind is not None:
+                self.table.selectRow(table_ind)
+            else:
+                return
+            
+    def set_data(self, feature_db):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(feature_db))
+        ix = 0
+        for row, feature_row in feature_db.iterrows():
+            self.table.setItem(ix, 0, widgets.QTableWidgetItem(str(row)))
+            for i, feature in enumerate(self.indiv_features):
+                self.table.setItem(ix, i+1, widgets.QTableWidgetItem(str("%.2f"%feature_row[feature])))
+            ix += 1
+        self.table.setSortingEnabled(True)
 
 class FeaturePlugin(BasePlugin):
 
     SAVE_FILENAME = "features.csv"
-
-    FEATURELIST = [
-        "fund", "devfund", "cvfund", "maxfund", "minfund", "F1", "F2", "F3", 
-        "sal", "rms", "maxAmp", "meanS", "stdS", "skewS", "kurtS", "entS", 
-        "q1", "q2", "q3", "meanT", "stdT", "skewT", "kurtT", "entT"
-    ]
+    FEATUREDICT = dict({
+        "Amplitude":["rms","meantime","stdT","skewT","kurtT","entT","maxAmp"],
+        "Fundamental":["fund","sal","fund2","sal2","maxfund","minfund","cvfund","cvfund2","devfund"],
+        "Formant":["F1","F2","F3"],
+        "Spectrum": ["meanS","stdS","skewS","kurtS","entS","q1","q2","q3"]
+    })
+    @property
+    def featurelist(self):
+        features = self.FEATUREDICT
+        indiv_features = []
+        for k,v in features.items():
+            indiv_features.extend(v)
+        return indiv_features
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
         self.worker_signals = WorkerSignals()
         self.config = dict()
         self.reset_config()
-        self.panel = FeatureGenerationPanel(features=self.FEATURELIST)
-
+        self.panel = FeatureGenerationPanel(features=self.FEATUREDICT)
+        self.feature_selections = { k: True for k in self.FEATUREDICT.keys()}
 
         self.connect_events()
+
+        self._needs_saving = False
+
+    def feature_selection_changed(self, feature_class, state):
+        self.feature_selections[feature_class] = state == 2
+        self.panel.set_feature_selection(self.feature_selections)
+
+    def connect_events(self):
+        # TODO Connect panel events
+        self.panel.generate_button.clicked.connect(self.launch_feature_generation_async)
+        for k in self.FEATUREDICT.keys():
+            self.panel.feature_checkboxes[k].stateChanged.connect(partial(self.feature_selection_changed, k))
+        self.panel.segmentSelectionChanged.connect(self.api.set_segment_selection)
+        
+        self.worker_signals.finished.connect(self.panel.on_finished_signal)
+        self.worker_signals.progress.connect(self.panel.on_progress_signal)
+        
+        # connect to api
+        self.api.segmentSelectionChanged.connect(self.on_segment_selection_changed)
+        self.api.projectLoaded.connect(self.on_project_ready)
+        self.api.projectDataLoaded.connect(self.on_project_data_loaded)
+
+
+    def on_segment_selection_changed(self):
+        selection = self.api.get_segment_selection()
+        self.panel.on_selection_changed(selection)
 
     def plugin_panel_widget(self):
         return [self.panel]
@@ -118,7 +259,7 @@ class FeaturePlugin(BasePlugin):
     def _feature_datastore(self):
         datastore = self._datastore
         if 'features' not in datastore:
-            datastore['features'] = pd.DataFrame(columns= self.FEATURELIST)
+            datastore['features'] = pd.DataFrame(columns= self.featurelist)
         return datastore['features']
 
     @_feature_datastore.setter
@@ -127,16 +268,12 @@ class FeaturePlugin(BasePlugin):
         if not isinstance(value, pd.DataFrame):
             raise ValueError("Feature datastore must be a pandas dataframe")
         # check that it has the requisite columns
-        if not all([c in value.columns for c in self.FEATURELIST]):
-            raise ValueError("Featire datastore must have columns %s" % (self.FEATURELIST))
+        if not all([c in value.columns for c in self.featurelist]):
+            raise ValueError("Featire datastore must have columns %s" % (self.featurelist))
         self._datastore["features"] = value
 
-    def connect_events(self):
-        # TODO Connect panel events
-        self.panel.generate_button.clicked.connect(self.launch_feature_generation_async)
-        self.worker_signals.finished.connect(self.panel.on_finished_signal)
-        self.worker_signals.progress.connect(self.panel.on_progress_signal)
-        self.api.projectLoaded.connect(self.on_project_ready)
+    def needs_saving(self):
+        return self._needs_saving
 
     def on_project_ready(self):
         """Called once"""
@@ -144,10 +281,10 @@ class FeaturePlugin(BasePlugin):
         if not save_file.exists():
             # initialize feature_datastore to an empty dataframe
             # with the correct columns
-            self._feature_datastore = pd.DataFrame(columns=self.FEATURELIST)
+            self._feature_datastore = pd.DataFrame(columns=self.featurelist)
             return
         
-        self._feature_datastore = pd.read_csv(save_file)
+        self._feature_datastore = pd.read_csv(save_file, index_col=0)
 
     def on_project_data_loaded(self):
         """Called each time project data is loaded"""
@@ -158,12 +295,26 @@ class FeaturePlugin(BasePlugin):
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.worker.submit(self.generate_all_features)
     
-    def get_segment_audio(self, segmentID):
+    def get_segment_audio(self, segmentID, lowpass=6000, highpass=200):
         """Get the audio data for a segment"""
         seg = self._datastore['segments'].loc[segmentID]
         sr = self.api.project.sampling_rate
         t, audio = self.api.get_signal(seg.StartIndex, seg.StopIndex)
         audio = audio[:,seg.Source.channel]
+
+        # Apply filtering
+        # high pass filter the signal
+        nfilt = 1024
+        soundLen = len(audio)
+        highpassFilter = firwin(nfilt-1, 2.0*highpass/sr, pass_zero=False)
+        padlen = min(soundLen-10, 3*len(highpassFilter))
+        soundIn = filtfilt(highpassFilter, [1.0], audio, padlen=padlen)
+
+        # low pass filter the signal
+        lowpassFilter = firwin(nfilt, 2.0*lowpass/sr)
+        padlen = min(soundLen-10, 3*len(lowpassFilter))
+        soundIn = filtfilt(lowpassFilter, [1.0], audio, padlen=padlen)
+
         return audio, sr
 
     def generate_all_features(self, overwrite=False):
@@ -175,52 +326,66 @@ class FeaturePlugin(BasePlugin):
         
         all_segIDs = self._datastore['segments'].index
         if overwrite:
-            processed_segIDs = self._feature_datastore.index
-        else:
             processed_segIDs = []
+        else:
+            processed_segIDs = self._feature_datastore.index
 
         # get segIDs that have not been processed
         unprocessed_segIDs = [segID for segID in all_segIDs if segID not in processed_segIDs]
 
-        nworkers = 4
+        # TODO CHeck if the other ones have had the feautres i want extracted
+        # if not, then add them to the unprocessed_segIDs
+        for segID in processed_segIDs:
+            for feature_cat in self.feature_selections.keys():
+                if self.feature_selections[feature_cat]:
+                    if all([np.isnan(self._feature_datastore.at[segID, feature]) for feature in self.FEATUREDICT[feature_cat]]):
+                        unprocessed_segIDs.append(segID)
+                        break   
+
+        nworkers = 6
         done_prep_event = Event()
         audio_queue = Queue()
         feature_queue = Queue()
-        progress_queue = Queue()
-        
-        progress_process = threading.Thread(target=progress_updater, args=(progress_queue, self.worker_signals.progress, len(unprocessed_segIDs)))
-        progress_process.start()
+
         feature_processes = []
         for i in range(nworkers):
-            feature_processes.append(FeatureExtractionProcess(audio_queue, feature_queue, progress_queue, done_prep_event))
+            feature_processes.append(FeatureExtractionProcess(audio_queue, feature_queue, done_prep_event, self.feature_selections))
             feature_processes[-1].start()
         
-        # TODO Can launch this on a thread...
-        max_queue_size = 4*nworkers
-        for segID in unprocessed_segIDs:
-            audio, sr = self.get_segment_audio(segID)
-            while audio_queue.qsize() > max_queue_size:
-                time.sleep(.1)
-            audio_queue.put((segID, audio, sr))
-        # now notify them no more will be added
-        done_prep_event.set()
+        loading_thread = threading.Thread(target=load_all_audio, args=(self.get_segment_audio, unprocessed_segIDs, audio_queue, 4*nworkers, done_prep_event))
+        loading_thread.start()
 
-        new_segs = []
-        while not np.all([p.is_alive() for p in feature_processes]) or not feature_queue.empty():
-            all_features = feature_queue.get()
-            features = {}
-            new_segs.append(feature_queue.get())
-            self.worker_signals.progress.emit(len(new_segs) / len(unprocessed_segIDs) * 100)
+        n_complete = 0
+        while np.any([p.is_alive() for p in feature_processes]) or not feature_queue.empty():
+            try:
+                segmentID, all_features = feature_queue.get(timeout=.5)
 
-        new_segs = pd.DataFrame(new_segs)
-        new_segs.set_index('SegmentID', inplace=True)
-        self._feature_datastore[new_segs.index] = new_segs
+                if segmentID not in self._feature_datastore.index:
+                    self._feature_datastore.loc[segmentID] = pd.Series()
+                for k,v in all_features.items():
+                    # Outer is Amplitude etc
+                    for kk,vv in v.items():
+                        # inner is columns
+                        self._feature_datastore.at[segmentID, kk] = vv
+                n_complete += 1
+                # This should be on a signal probably
+                self.panel.add_or_edit_row(self._feature_datastore.loc[segmentID])
+                self.worker_signals.progress.emit(n_complete / len(unprocessed_segIDs) * 100)
+            except Exception as e:
+                continue
+        print("OUT O HERE")
         self.worker_signals.finished.emit()
-        #self._feature_datastore = pd.concat([self._feature_datastore, new_segs])
+        self._needs_saving = True
+        # do the cleanup
+        for p in feature_processes:
+            p.join()
+        loading_thread.join()
 
-    def save_features(self):
+
+    def save(self):
         save_file = self.api.paths.save_dir / self.SAVE_FILENAME
-        self._feature_datastore.to_csv(save_file)
+        self._feature_datastore.to_csv(save_file, index_label='SegmentID')
+        self._needs_saving = False
 
 def progress_updater(progress_queue_in, progress_signal_out, n):
     n_done = 0
@@ -238,63 +403,46 @@ def load_all_audio(load_func, seg_ids, queue, max_queue_size, done_event):
         queue.put((seg_id, audio, sr))
     done_event.set()
 class FeatureExtractionProcess(Process):
-    def __init__(self, in_queue, out_queue, progress_queue, stop_signal):
+    def __init__(self, in_queue, out_queue, stop_signal, feature_selections):
         super().__init__()
         self.input_queue = in_queue
         self.stop_signal = stop_signal
         self.output_queue = out_queue
-        self.progress_queue = progress_queue
+        self.feature_selections = feature_selections
 
     def run(self):
         print("Beginning Feature Extraction Process")
-        while not self.stop_signal.is_set() or not self.queue.empty():
-            segmentID, audio, sr = self.input_queue.get()
-            features = generate_audio_features(audio, sr, segmentID)
-            self.output_queue.put(features)
-            self.progress_queue.put(segmentID)
+        while not self.stop_signal.is_set() or not self.input_queue.empty():
+            try:
+                segmentID, audio, sr = self.input_queue.get(timeout=.5)
+                features = generate_audio_features(audio, sr, segmentID, self.feature_selections)
+                self.output_queue.put(features)
+            except Exception as e:
+                continue
         print("Exiting feature extraction process")
 #from numba import jit
 #@jit(nogil=True)
-def _extract_features( audio: np.ndarray, sr: int, segmentID: int, normalize: bool) -> List[float]:
+def _extract_features( audio: np.ndarray, sr: int, feature_selections: dict, normalize: bool) -> List[float]:
     """Extract features from audio"""
     if normalize:
         audio = audio / np.max(audio)
-
-
-    f_amp = features_ampenv(audio, sr)
-    f_fund = features_fundamental(audio, sr)
-    f_formants = features_formants(audio, sr)
-    f_spectrum = features_spectrum(audio, sr)
-    # combine all these dictionaries
-    output_features = dict({
-        "amp": f_amp,
-        "fund": f_fund,
-        "formants": f_formants,
-        "spectrum": f_spectrum  
-    })
+    output_features = dict() 
+    if feature_selections is None or feature_selections['Amplitude']:
+        output_features['Amplitude'] = features_ampenv(audio, sr)
+    if feature_selections is None or feature_selections['Fundamental']:
+        output_features['Fundamental'] = features_fundamental(audio, sr)
+    if feature_selections is None or feature_selections['Formant']:
+        output_features['Formant'] = features_formants(audio, sr)
+    if feature_selections is None or feature_selections['Spectrum']:
+        output_features['Spectrum'] = features_spectrum(audio, sr)
     return output_features
-
-    # return dict({ 'SegmentID': segmentID,
-    #                 "fund": fund, "devfund": devfund,
-    #                 "cvfund": cvfund, "maxfund": maxfund, "minfund": minfund,
-    #                 "F1": meanF1, "F2": meanF2, "F3":meanF3,
-    #                 "sal": float(myBioSound.meansal), 
-    #                 "rms": float(myBioSound.rms), 
-    #                 "maxAmp": float(myBioSound.maxAmp),
-    #                 "meanS": float(myBioSound.meanspect), "stdS": float(myBioSound.stdspect),
-    #                 "skewS": float(myBioSound.skewspect), "kurtS": float(myBioSound.kurtosisspect), 
-    #                 "entS": float(myBioSound.entropyspect),
-    #                 "q1": float(myBioSound.q1), "q2": float(myBioSound.q2), "q3": float(myBioSound.q3),                  
-    #                 "meanT": float(myBioSound.meantime), "stdT": float(myBioSound.stdtime),
-    #                 "skewT": float(myBioSound.skewtime), "kurtT": float(myBioSound.kurtosistime),
-    #                 "entT": float(myBioSound.entropytime)})
 
 
 # from numba import jit
 # @jit(nogil=True)
-def generate_audio_features(audio, sr, segmentID, normalize=True):
+def generate_audio_features(audio, sr, segmentID, feature_selections = None, normalize=True):
     """Generate features for audio data"""
-    return _extract_features(audio, sr, segmentID=segmentID, normalize=normalize)
+    return segmentID, _extract_features(audio, sr, feature_selections = feature_selections, normalize=normalize)
 
 def generate_segment_features(segmentID, seg_datastore, api):
     """Generate features for a single segment"""
@@ -327,17 +475,17 @@ def features_ampenv(audio, sr, cutoff_freq = 20, amp_sample_rate = 1000):
     indpos = np.where(ampdata>0)[0]
     entropytime = -np.sum(ampdata[indpos]*np.log2(ampdata[indpos]))/np.log2(np.size(indpos))
     return dict({
-        'rms': audio.std(),
+        "rms": audio.std(),
         "meantime": meantime,
-        "stdtime": stdtime,
-        "skewtime": skewtime,
-        "kurtosistime": kurtosistime,
-        "entropytime": entropytime,
+        "stdT": stdtime,
+        "skewT": skewtime,
+        "kurtT": kurtosistime,
+        "entT": entropytime,
         "maxAmp": max(amp),
     })
 
 def features_fundamental(audio, sr, maxFund = 1500, minFund = 300, lowFc = 200, highFc = 6000, minSaliency = 0.5, method='HPS'):
-    funds_salience = sound.fundEstOptim(audio, sr, stride_length=256, maxFund = maxFund, minFund = minFund, lowFc = lowFc, highFc = highFc, minSaliency = minSaliency, method = method)
+    funds_salience = sound.fundEstOptim(audio, sr, maxFund = maxFund, minFund = minFund, nofilt=True, lowFc = lowFc, highFc = highFc, minSaliency = minSaliency, method = method)
     f0 = funds_salience[:,0]
     f0_2 = funds_salience[:,1]
     sal = funds_salience[:,2]
@@ -365,7 +513,7 @@ def features_fundamental(audio, sr, maxFund = 1500, minFund = 300, lowFc = 200, 
     #self.voice2percent = np.nanmean(funds_salience[:,4])*100
 
 def features_formants(audio, sr,  lowFc = 200, highFc = 6000, minFormantFreq = 500, maxFormantBW = 500, windowFormant = 0.1):
-    formants = sound.formantEstimator(audio, sr, stride_length=256,lowFc=lowFc, highFc=highFc, windowFormant = windowFormant,
+    formants = sound.formantEstimator(audio, sr, nofilt=True, lowFc=lowFc, highFc=highFc, windowFormant = windowFormant,
                                     minFormantFreq = minFormantFreq, maxFormantBW = maxFormantBW )
     F1 = formants[:,0]
     F2 = formants[:,1]
@@ -375,9 +523,9 @@ def features_formants(audio, sr,  lowFc = 200, highFc = 6000, minFormantFreq = 5
     meanF2 = np.nanmean(F2)
     meanF3 = np.nanmean(F3)
     return dict({
-        "meanF1":meanF1,
-        "meanF2":meanF2,
-        "meanF3":meanF3
+        "F1":meanF1,
+        "F2":meanF2,
+        "F3":meanF3
     })
 
 
@@ -424,11 +572,11 @@ def features_spectrum(audio, sr, f_high = 10000):
     q3 = Freqs[quartile_freq[2]]
 
     return dict({
-        "meanspect":meanspect,
-        "stdspect":stdspect,
-        "skewspect":skewspect,
-        "kurtosisspect":kurtosisspect,
-        "entropyspect":entropyspect,
+        "meanS":meanspect,
+        "stdS":stdspect,
+        "skewS":skewspect,
+        "kurtS":kurtosisspect,
+        "entS":entropyspect,
         "q1":q1,
         "q2":q2,
         "q3":q3

@@ -32,11 +32,14 @@ class SelectionService:
 
     Includes a "fine selection", which is a smaller ROI on top of the main roi
     that can be accessed with get_fine_selection()
+
+    Includes a "segment selection", which is a single segment ID
     """
     def __init__(self, project: Project):
         self.project = project
         self._selection = None
         self._fine_selection = None
+        self._segment_selection = []
 
     def is_set(self) -> bool:
         return self._selection is not None
@@ -76,6 +79,7 @@ class SelectionService:
     def get_selection(self) -> Optional[Selection]:
         return self._selection
 
+    # Fine selection
     def set_fine_selection(self, x0: ProjectIndex, x1: ProjectIndex):
         if not self._selection:
             raise ValueError("Cannot set a fine selection if no current selection exists")
@@ -87,6 +91,16 @@ class SelectionService:
 
     def get_fine_selection(self) -> Optional[Selection]:
         return self._fine_selection or self._selection
+
+    # Segment selection
+    def set_segment_selection( self, segIDs):
+        self._segment_selection = segIDs.copy()
+    
+    def get_segment_selection(self):
+        return self._segment_selection.copy()
+    
+    def clear_segment_selection(self):
+        self._segment_selection = []
 
 
 class SourceService(list):
