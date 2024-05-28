@@ -685,6 +685,7 @@ class SegmentPlugin(BasePlugin):
         
         
         # TODO change panel to add a single row
+        self.api.segment_created(segID)
         self.panel.add_row(self._segmentation_datastore.loc[segID], self.api.project)
         self.umap_panel.add_spot(self._segmentation_datastore.loc[segID], self.api.plugins["TagPlugin"].get_tag_color)
         
@@ -715,6 +716,7 @@ class SegmentPlugin(BasePlugin):
 
         for segID in seg_ids:
             self.panel.remove_row_by_segID(segID)
+            self.api.segment_deleted(segID)
         self.umap_panel.remove_spots(seg_ids)
         self._needs_saving = True
         if refresh:

@@ -33,29 +33,246 @@ class WorkerSignals(QObject):
     progress = pyqtSignal(int)
 
 
+
+class VisualizationPanel(widgets.QWidget):
+    segmentSelectionChanged = pyqtSignal(object)
+    def __init__(self, parent=None, api=None):
+        super().__init__(parent)
+        self.api=api
+        self.init_ui()
+        self.init_actions()
+        self.npoints = 0
+
+    def init_ui(self):
+        # setup a 2d plot
+        layout = widgets.QVBoxLayout()
+        # Add two drop down menus for x and y axis features
+        self.x_axis = widgets.QComboBox()
+        self.y_axis = widgets.QComboBox()
+        x_y_layout = widgets.QHBoxLayout()
+        x_y_layout.addWidget(widgets.QLabel("X-Axis:"))
+        x_y_layout.addWidget(self.x_axis)
+        x_y_layout.addWidget(widgets.QLabel("Y-Axis:"))
+        x_y_layout.addWidget(self.y_axis)
+        layout.addLayout(x_y_layout)
+        # Add the plot
+        self.plot = pg.plot()
+        self.scatter = pg.ScatterPlotItem()
+        self.plot.addItem(self.scatter)
+        #layout = widgets.QGridLayout()
+        layout.addWidget(self.plot)
+        self.setLayout(layout)
+
+    def add_features_to_dropdown(self, features):
+        self.x_axis.addItems(features)
+        self.y_axis.addItems(features)
+    
+    def init_actions(self):
+        self.x_axis.currentIndexChanged.connect(self.on_x_axis_change)
+        self.y_axis.currentIndexChanged.connect(self.on_y_axis_change)
+        self.scatter.sigClicked.connect(self.on_click)
+        return
+    
+    def on_click(self, plot, points):
+        if len(points) > 0:
+            # TODO what to do for multiselect
+            self.segmentSelectionChanged.emit([points[0].data()])
+        return
+
+    def on_x_axis_change(self, ind):
+        self.update_spots()
+
+    def on_y_axis_change(self, ind):
+        self.update_spots()
+
+    def on_selection_changed(self, selection):
+        sizes = np.ones(self.npoints) * 10
+        spot_inds = [spot['data'] for spot in self.scatter.data]
+        sel_inds = []
+        for s in selection:
+            if s in spot_inds:
+                sel_inds.append(spot_inds.index(s))
+        if len(sel_inds) > 0:
+            sizes[sel_inds] = 20
+        self.scatter.setSize(sizes)
+    
+    def set_data(self, features, func_get_color=None):
+        spots = []
+        for ix,feat_row in features.iterrows():
+            tags = self.api.plugins['segments'].get_tags_for_segment(ix)
+            if func_get_color and len(s_row['Tags']) > 0:
+                c = func_get_color(list(s_row['Tags'])[0])
+            else:
+                c = 'r'
+            if s_row['Coords'] != None and len(s_row['Coords']) >= 2:
+                spots.append(dict({
+                    'pos': s_row['Coords'][:2],
+                    'data': ix,
+                    'brush': pg.mkBrush(c),
+                    'size': 10
+                }))
+        
+        self.npoints = len(spots)
+        self.scatter.setData(
+            spots=spots,
+            hoverSize=20,
+            hoverable=True
+        )
+    
+    def remove_spots(self, segIDs):
+        visibilities = self.scatter.data['visible']
+        spot_seg_IDs = [spot['data'] for spot in self.scatter.data]
+        for segID in segIDs:
+            if segID in spot_seg_IDs:
+                visibilities[spot_seg_IDs.index(segID)] = False
+                #spot_inds.append(seg_IDs.index(segID))
+        self.scatter.setPointsVisible(visibilities)
+
+    def add_spot(self, segID, coords, color='r'):
+        self.scatter.addPoints(
+            pos=[coords],
+            data=segID,
+            brush=pg.mkBrush(color),
+            size=10
+        )
+        self.npoints += 1
+
+    def update_spots(self, func_get_color=None):
+        spot_seg_IDs = self.scatter.data['data']
+        spot_brushes = [spot['brush'] for spot in self.scatter.data]
+        mut_ds = self.api.get_mut_datastore()
+        seg_db = mut_ds['segments']
+        feat_db = mut_ds['features']
+        # confirm that the x and y axis are in the features
+        x_axis = self.x_axis.currentText()
+        y_axis = self.y_axis.currentText()
+
+        if x_axis == "" or y_axis == "":
+            return
+
+        if x_axis not in feat_db.columns or y_axis not in feat_db.columns:
+            return
+
+        # only take segments that are in the feature db
+        segments = seg_db.loc[feat_db.index]
+        data = self.scatter.data
+        if spot_seg_IDs != []:
+            data['x'] = feat_db[x_axis].loc[spot_seg_IDs]
+            data['y'] = feat_db[y_axis].loc[spot_seg_IDs]
+            self.scatter.updateSpots()
+            vb = self.scatter.getViewBox()
+            xrange = self.scatter.dataBounds(0)
+            vb.setXRange(xrange[0], xrange[1])
+            yrange = self.scatter.dataBounds(1)
+            vb.setYRange(yrange[0], yrange[1])
+            # self.scatter.invalidate()
+        segs_to_add = []
+        segments_not_present = segments[~segments.index.isin(spot_seg_IDs)]
+        for ix, s_row in segments_not_present.iterrows():
+            if feat_db.loc[ix][x_axis] is not np.nan and feat_db.loc[ix][y_axis] is not np.nan:
+                segs_to_add.append((s_row, [feat_db.loc[ix][x_axis], feat_db.loc[ix][y_axis]]))
+
+        # now add the ones that were not present
+        for s_row, coords in segs_to_add:
+            self.add_spot(s_row.name, coords)# TODO func_get_color
+
+class DimensionalityReductionWizard(widgets.QWidget):
+    """ Window for selecting features to include in PCA"""
+    feature_generation_signal = pyqtSignal(object, str, str)
+    def __init__(self,parent=None, features=None, feature_percents=None, feat_check_callback=None):
+        super().__init__(parent)
+        self.features = features
+        self.feat_check_callback = feat_check_callback
+        self.feature_percents = feature_percents
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = widgets.QVBoxLayout()
+        # Add checkboxes for each feature class
+        self.feature_checkboxes = {}
+        checkbox_layout = widgets.QHBoxLayout()
+        sub_layouts = {}
+        for k in self.features.keys():
+            sub_layouts[k] = widgets.QVBoxLayout()
+            sub_layouts[k].addWidget(widgets.QLabel(k))
+            for ix,kk in enumerate(self.features[k]):
+                self.feature_checkboxes[kk] = widgets.QCheckBox(kk)
+                sub_layouts[k].addWidget(self.feature_checkboxes[kk])
+                pcen = self.feature_percents[k][ix]
+                sub_layouts[k].addWidget(widgets.QLabel("NaNs: %.2f" % (pcen*100)))
+                self.feature_checkboxes[kk].setChecked(pcen < .1)
+                self.feature_checkboxes[kk].stateChanged.connect(self.on_box_checked)
+            checkbox_layout.addLayout(sub_layouts[k])
+        layout.addLayout(checkbox_layout)
+
+        # add a label for total number of stims
+        n_good, n_total = self.feat_check_callback(self.get_selected_features())
+        self.n_stims_label = widgets.QLabel("Number of stims: %d/%d" % (n_good, n_total))
+        layout.addWidget(self.n_stims_label)
+
+        # add a drop down for type of dimensionality reduction
+        self.dim_reduction_type = widgets.QComboBox()
+        self.dim_reduction_type.addItems(["PCA", "UMAP"])
+        layout.addWidget(self.dim_reduction_type)
+
+        # add a clear all boxes button
+        self.clear_all_button = widgets.QPushButton("Uncheck All")
+        self.clear_all_button.clicked.connect(self.clear_checkboxes)
+        layout.addWidget(self.clear_all_button)
+
+        # TODO can add some params here
+
+        # Add a generate button with a field for the name of the new feature
+        generation_layout = widgets.QHBoxLayout()
+        self.feat_name = widgets.QLineEdit("DimRed1")
+        generation_layout.addWidget(widgets.QLabel("Feature Name:"))
+        generation_layout.addWidget(self.feat_name)
+        self.generate_button = widgets.QPushButton("Generate")
+        self.generate_button.clicked.connect(self.on_generate_button_press)
+        generation_layout.addWidget(self.generate_button)
+        layout.addLayout(generation_layout)
+        self.setLayout(layout)
+
+    def on_box_checked(self, state):
+        # check how many stims are good for these features
+        if self.feat_check_callback:
+            n_good, n_total = self.feat_check_callback(self.get_selected_features())
+            self.n_stims_label.setText("Number of stims: %d/%d" % (n_good, n_total))
+    def clear_checkboxes(self):
+        for k,v in self.feature_checkboxes.items():
+            v.setChecked(False)
+    def get_selected_features(self):
+        selected_features = []
+        for k,v in self.feature_checkboxes.items():
+            if v.isChecked():
+                selected_features.append(k)
+        return selected_features
+
+    def on_generate_button_press(self):
+        selected_features = self.get_selected_features()
+        dim_reduction_type = self.dim_reduction_type.currentText()
+        new_feature_name = self.feat_name.text()
+        self.feature_generation_signal.emit(selected_features, dim_reduction_type, new_feature_name)
+
 class FeatureGenerationPanel(widgets.QWidget):
     segmentSelectionChanged = pyqtSignal(object)
-
-
     def __init__(self, parent=None,features=None):
         super().__init__(parent)
 
         self.FEATUREDICT=features        
         self.indiv_features = []
-        for k,v in features.items():
-            self.indiv_features.extend(v)
+        if features is not None:
+            for k,v in features.items():
+                self.indiv_features.extend(v)
         self.init_ui()
 
     
     def init_ui(self):
-
-        
-
         layout = widgets.QVBoxLayout()
         # add a generate button
         self.generate_button = widgets.QPushButton("Generate")
         layout.addWidget(self.generate_button)
-        self.generate_button.clicked.connect(self.on_button_press)
+        self.generate_button.clicked.connect(self.on_generate_button_press)
         
         # Add checkboxes for each feature class
         self.feature_checkboxes = {}
@@ -79,6 +296,10 @@ class FeatureGenerationPanel(widgets.QWidget):
             header.setSectionResizeMode(i, widgets.QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
 
+        # Dim reduction generation button
+        self.generate_DR_button = widgets.QPushButton("Generate Dimensionality Reduction")
+        layout.addWidget(self.generate_DR_button)
+
         self.setLayout(layout)
 
         # init actions
@@ -92,7 +313,7 @@ class FeatureGenerationPanel(widgets.QWidget):
             for feature in self.FEATUREDICT[k]:
                 self.table.setColumnHidden(self.feature_to_column[feature], not v)
 
-    def on_button_press(self):
+    def on_generate_button_press(self):
         # Add a progress bar into the qvboxlayout
         self.progress = widgets.QProgressBar(self)
         self.progress.setGeometry(200, 80, 250, 20)
@@ -105,6 +326,19 @@ class FeatureGenerationPanel(widgets.QWidget):
     
     def on_finished_signal(self):
         self.progress.deleteLater()
+
+    def add_feature(self, feature_name, df_feature_data):
+        self.indiv_features.append(feature_name)
+        self.table.insertColumn(self.table.columnCount())
+        self.table.setHorizontalHeaderItem(self.table.columnCount()-1, widgets.QTableWidgetItem(feature_name))
+        self.table.setColumnHidden(self.table.columnCount()-1, True)
+        self.feature_to_column[feature_name] = self.table.columnCount()-1
+        for i in range(self.table.rowCount()):
+            segID = int(self.table.item(i, 0).text())
+            if segID in df_feature_data.index:
+                self.table.setItem(i, self.table.columnCount()-1, widgets.QTableWidgetItem(str("%.2f"%df_feature_data.at[segID])))
+
+        
 
     def add_or_edit_row(self, feature_row):
         ind = self._find_segment_row_by_segID(feature_row.name)
@@ -186,6 +420,8 @@ class FeatureGenerationPanel(widgets.QWidget):
             ix += 1
         self.table.setSortingEnabled(True)
 
+from sklearn.decomposition import PCA
+import umap
 class FeaturePlugin(BasePlugin):
 
     SAVE_FILENAME = "features.csv"
@@ -202,6 +438,26 @@ class FeaturePlugin(BasePlugin):
         for k,v in features.items():
             indiv_features.extend(v)
         return indiv_features
+
+    def current_featurelist(self):
+        feature_selections = self.feature_selections
+        features = self.FEATUREDICT
+        indiv_features = []
+        for k,v in features.items():
+            if feature_selections[k]:
+                indiv_features.extend(v)
+        return indiv_features
+
+    def get_custom_features(self):
+        feature_list = self.current_featurelist()
+        # now get the custom features
+        col_names = self._datastore['features'].columns
+        custom_features = []
+        for feature in col_names:
+            if feature not in feature_list:
+                custom_features.append(feature)
+        return custom_features
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -209,6 +465,7 @@ class FeaturePlugin(BasePlugin):
         self.config = dict()
         self.reset_config()
         self.panel = FeatureGenerationPanel(features=self.FEATUREDICT)
+        self.vis_panel = VisualizationPanel(api=self.api)
         self.feature_selections = { k: True for k in self.FEATUREDICT.keys()}
 
         self.connect_events()
@@ -225,7 +482,9 @@ class FeaturePlugin(BasePlugin):
         for k in self.FEATUREDICT.keys():
             self.panel.feature_checkboxes[k].stateChanged.connect(partial(self.feature_selection_changed, k))
         self.panel.segmentSelectionChanged.connect(self.api.set_segment_selection)
-        
+        self.panel.generate_DR_button.clicked.connect(self.on_dim_reduce_button_press)
+        self.vis_panel.segmentSelectionChanged.connect(self.api.set_segment_selection)
+
         self.worker_signals.finished.connect(self.panel.on_finished_signal)
         self.worker_signals.progress.connect(self.panel.on_progress_signal)
         
@@ -233,14 +492,16 @@ class FeaturePlugin(BasePlugin):
         self.api.segmentSelectionChanged.connect(self.on_segment_selection_changed)
         self.api.projectLoaded.connect(self.on_project_ready)
         self.api.projectDataLoaded.connect(self.on_project_data_loaded)
+        self.api.segmentDeleted.connect(self.on_segment_deleted)
 
 
     def on_segment_selection_changed(self):
         selection = self.api.get_segment_selection()
         self.panel.on_selection_changed(selection)
+        self.vis_panel.on_selection_changed(selection)
 
     def plugin_panel_widget(self):
-        return [self.panel]
+        return [self.panel, self.vis_panel]
     # def add_plugin_menu(self, menu_parent):
     #     menu = menu_parent.addMenu("&Segments")
     #     menu.addAction(self.generate_all_features)
@@ -289,11 +550,72 @@ class FeaturePlugin(BasePlugin):
     def on_project_data_loaded(self):
         """Called each time project data is loaded"""
         self.panel.set_data(self._feature_datastore)
+        self.vis_panel.add_features_to_dropdown(self.featurelist)
+        self.vis_panel.update_spots()
     
+    def get_feat_percent(self, feature):
+        feature_db = self._feature_datastore[feature]
+        return feature_db.isnull().mean()
+
+    def get_number_of_stim_for_selection(self, features):
+        feature_db = self._feature_datastore[features]
+        feature_db_tmp = feature_db.dropna()
+        return len(feature_db_tmp),len(feature_db)
+
+    def on_dim_reduce_button_press(self):
+        # Make a popup window to select the features to include
+        # Then generate the PCA features
+        features_to_include = self.FEATUREDICT.copy()
+        custom_feats = self.get_custom_features()
+        if len(custom_feats) > 0:
+            features_to_include['Custom'] = self.get_custom_features()
+        feat_percents = {}
+        for k in features_to_include.keys():
+            feat_percents[k] = [self.get_feat_percent(f) for f in features_to_include[k]]
+
+        self.dim_red_window = DimensionalityReductionWizard(features=features_to_include, feature_percents=feat_percents, feat_check_callback = self.get_number_of_stim_for_selection)
+        self.dim_red_window.feature_generation_signal.connect(self.on_dim_reduction_generate)
+        self.dim_red_window.show()
+    
+    def on_dim_reduction_generate(self, features, dim_reduction_type, new_feature_name):
+        # TODO generate the new feature
+        print(features, dim_reduction_type, new_feature_name)
+        if dim_reduction_type == "PCA":
+            self.generate_PCA_Feature(new_feature_name,features)
+        self.dim_red_window.close()
+
+    def generate_PCA_Feature(self, feat_name, features):
+        """Generates PCA Feature based on currently visible features"""
+        feature_db = self._feature_datastore[features]
+        feature_db = feature_db.dropna()
+        data = feature_db.to_numpy()
+        # todo could balance across channels
+        Zdata = (data - data.mean(axis=0))/ np.std(data,axis=0,ddof=1)
+
+        # PCA the data
+        pca = PCA(n_components=10, svd_solver='full')
+        Z_PCA_DATA = pca.fit_transform(Zdata)
+        # Add the PCA data to the feature db
+        for i in range(Z_PCA_DATA.shape[1]):
+            self._feature_datastore.loc[feature_db.index, feat_name + str(i)] = Z_PCA_DATA[:,i]
+            self.panel.add_feature(feat_name + str(i),  self._feature_datastore[feat_name + str(i)])
+            self.vis_panel.add_features_to_dropdown([feat_name + str(i)])
+
+    def generate_UMAP_Feature(self, feat_name, features):
+        pass
+
+
+# FEATURE GENERATION
     def launch_feature_generation_async(self):
         # launch feature generation in a separate thread
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.worker.submit(self.generate_all_features)
+
+    def on_segment_deleted(self, segmentID):
+        self._feature_datastore.drop(segmentID, inplace=True)
+        self._needs_saving = True
+        self.panel.remove_row_by_segID(segmentID)
+        self.vis_panel.remove_spots([segmentID])
     
     def get_segment_audio(self, segmentID, lowpass=6000, highpass=200):
         """Get the audio data for a segment"""
@@ -484,21 +806,35 @@ def features_ampenv(audio, sr, cutoff_freq = 20, amp_sample_rate = 1000):
         "maxAmp": max(amp),
     })
 
+
+
 def features_fundamental(audio, sr, maxFund = 1500, minFund = 300, lowFc = 200, highFc = 6000, minSaliency = 0.5, method='HPS'):
     funds_salience = sound.fundEstOptim(audio, sr, maxFund = maxFund, minFund = minFund, nofilt=True, lowFc = lowFc, highFc = highFc, minSaliency = minSaliency, method = method)
     f0 = funds_salience[:,0]
     f0_2 = funds_salience[:,1]
     sal = funds_salience[:,2]
     sal_2 = funds_salience[:,3]
-    fund = np.nanmean(funds_salience[:,0])
-    meansal = np.nanmean(funds_salience[:,2])
-    fund2 = np.nanmean(funds_salience[:,1])
-    meansal2 = np.nanmean(funds_salience[:,3])
-    maxfund = np.nanmax(f0)
-    minfund = np.nanmin(f0)
-    cvfund = np.nanstd(f0)/fund
-    cvfund2 = np.nanstd(f0_2)/fund2
-    devfund = np.nanmean(np.diff(f0))
+    if np.isnan(f0).all():
+        fund = np.nan
+        maxfund = np.nan
+        minfund = np.nan
+        cvfund = np.nan
+        devfund = np.nan
+    else:
+        meansal = np.nanmean(sal)
+        fund = np.nanmean(f0)
+        maxfund = np.nanmax(f0)
+        minfund = np.nanmin(f0)
+        cvfund = np.nanstd(f0)/fund
+        devfund = np.nanmean(np.diff(f0))
+    if np.isnan(f0_2).all():
+        fund2 = np.nan
+        meansal2 = np.nan
+        cvfund2 = np.nan
+    else:
+        fund2 = np.nanmean(f0_2)
+        cvfund2 = np.nanstd(f0_2)/fund2
+        meansal2 = np.nanmean(sal_2)
     return dict({
         "fund":fund,
         "sal":meansal,
@@ -512,16 +848,27 @@ def features_fundamental(audio, sr, maxFund = 1500, minFund = 300, lowFc = 200, 
         })
     #self.voice2percent = np.nanmean(funds_salience[:,4])*100
 
-def features_formants(audio, sr,  lowFc = 200, highFc = 6000, minFormantFreq = 500, maxFormantBW = 500, windowFormant = 0.1):
+def features_formants(audio, sr,  lowFc = 200, highFc = 6000, minFormantFreq = 500, maxFormantBW = 1000, windowFormant = 0.1):
     formants = sound.formantEstimator(audio, sr, nofilt=True, lowFc=lowFc, highFc=highFc, windowFormant = windowFormant,
                                     minFormantFreq = minFormantFreq, maxFormantBW = maxFormantBW )
     F1 = formants[:,0]
     F2 = formants[:,1]
     F3 = formants[:,2]
-    # Take the time average formants 
-    meanF1 = np.nanmean(F1)
-    meanF2 = np.nanmean(F2)
-    meanF3 = np.nanmean(F3)
+
+    # Take the time average formants only if there are some non nan numbers
+    if np.sum(~np.isnan(F1)) > 0:
+        meanF1 = np.nanmean(F1)
+    else:
+        meanF1 = np.nan
+    if np.sum(~np.isnan(F2)) > 0:
+        meanF2 = np.nanmean(F2)
+    else:
+        meanF2 = np.nan
+    if np.sum(~np.isnan(F3)) > 0:
+        meanF3 = np.nanmean(F3)
+    else:
+        meanF3 = np.nan
+
     return dict({
         "F1":meanF1,
         "F2":meanF2,
